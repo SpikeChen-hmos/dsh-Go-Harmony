@@ -1,0 +1,165 @@
+# Build an OpenHarmony arm64 Node 24.22.1 + V8 startup snapshot (item 6).
+#
+# Why CI: producing the snapshot needs a Linux host with the OHOS native SDK and
+# a cross-capable clang; the Windows dev machine has neither. The artifact is
+# device-architecture specific (arm64-ohos), so it must be built for the target,
+# not on the phone.
+#
+# Inputs the job expects (adjust the TODO lines when the fork gains them):
+#   - Node source: https://nodejs.org/dist/v24.22.1/node-v24.22.1.tar.xz
+#   - OHOS native SDK (API 26 / 26.0.0.38), Linux x86_64 archive from the
+#     OpenHarmony/SDK mirror used by the official runtime/ohos/node/BUILD.md.
+#   - The official OHOS Node patches: runtime/ohos/node/node24-ohos.diff and
+#     tooling/ohos/prepare-node-fetch.mjs (already in this repository at v1.3.0).
+#
+# The output of interest is snapshot_blob.bin (plus node_mksnapshot for a rerun);
+# copy it into the runtime zip as node_modules/.v8-snapshot/snapshot_blob.bin and
+# pass `--snapshot-blob` through the legacy host argv when starting the engine.
+name: OHOS node snapshot
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ohos/node-snapshot]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      NODE_VERSION: 24.22.1
+      OHOS_API: 26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install host toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential python3 cmake ninja-build \
+            clang-18 lld-18 libc++-18-dev libc++abi-18-dev libssl-dev \
+            xz-utils curl git patch
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-18 100
+          clang --version
+
+      - name: Fetch Node source
+        run: |
+          set -euxo pipefail
+          BASE="https://nodejs.org/dist/v${NODE_VERSION}"
+          MIRROR="https://npmmirror.com/mirrors/node/v${NODE_VERSION}"
+          ok=0
+          for url in "$BASE" "$MIRROR"; do
+            for attempt in 1 2 3 4 5; do
+              if curl -fsSL --connect-timeout 20 --max-time 300 -o "node-v${NODE_VERSION}.tar.xz" "$url/node-v${NODE_VERSION}.tar.xz" \
+                 && curl -fsSL --connect-timeout 20 --max-time 120 -o SHASUMS256.txt "$url/SHASUMS256.txt"; then
+                ok=1; break 2
+              fi
+              echo "retry $attempt for $url"; sleep 15
+            done
+          done
+          test "$ok" = 1
+          grep " node-v${NODE_VERSION}.tar.xz\$" SHASUMS256.txt | sha256sum -c -
+          tar -xf "node-v${NODE_VERSION}.tar.xz"
+          mv "node-v${NODE_VERSION}" node-src
+
+      # TODO: replace with the Linux OHOS SDK archive URL the fork can fetch
+      # without a Huawei account (public OpenHarmony SDK mirror). The archive
+      # No repository variable needed: the public OpenHarmony SDK mirror serves
+      # the Windows/Linux bundle without a Huawei account.
+      - name: Fetch OpenHarmony native SDK
+        run: |
+          set -euxo pipefail
+          SDK_URL="${OHOS_SDK_URL:-https://repo.huaweicloud.com/openharmony/os/5.0.0-Release/ohos-sdk-windows_linux-public.tar.gz}"
+          ok=0
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL --connect-timeout 20 --max-time 1800 -o ohos-sdk-public.tar.gz "$SDK_URL"; then ok=1; break; fi
+            echo "retry $attempt"; sleep 20
+          done
+          test "$ok" = 1
+          mkdir -p ohos-sdk && tar -xzf ohos-sdk-public.tar.gz -C ohos-sdk
+          ls ohos-sdk/linux | head
+          NATIVE_ZIP=$(ls ohos-sdk/linux/native-linux-x64-*.zip | head -1)
+          unzip -q "$NATIVE_ZIP" -d ohos-sdk/native
+          test -d ohos-sdk/native/native || { echo "native sysroot missing"; find ohos-sdk -maxdepth 3 -type d | head; exit 1; }
+        env:
+          OHOS_SDK_URL: ${{ vars.OHOS_SDK_URL }}
+
+      - name: Apply official OHOS Node patches
+        run: |
+          patch -d node-src -p1 < runtime/ohos/node/node24-ohos.diff
+          node --version >/dev/null 2>&1 || true
+          # prepare-node-fetch.mjs belongs to the official host build; run it only
+          # when the fork ships Node's embedded-undici patch inputs.
+          if [ -f tooling/ohos/prepare-node-fetch.mjs ]; then
+            node tooling/ohos/prepare-node-fetch.mjs --source node-src || true
+          fi
+
+      - name: Patch zlib for the OHOS sysroot
+        working-directory: node-src
+        run: |
+          set -euxo pipefail
+          # The SDK sysroot has no Linux ARM hwcap headers; disable zlib's
+          # ARMV8_OS_LINUX fast paths instead of pulling kernel headers.
+          sed -i 's/OS=="linux" or OS=="openharmony"/OS=="linux"/g' deps/zlib/zlib.gyp
+          grep -n 'ARMV8_OS_LINUX' deps/zlib/zlib.gyp | head -5 || true
+
+      - name: Configure cross build
+        working-directory: node-src
+        run: |
+          set -euxo pipefail
+          SDK="$GITHUB_WORKSPACE/ohos-sdk/native/native"
+          ls "$SDK" || { echo "SDK layout:"; find "$GITHUB_WORKSPACE/ohos-sdk" -maxdepth 3 -type d | head -30; exit 1; }
+          export CC="$SDK/llvm/bin/clang" CXX="$SDK/llvm/bin/clang++"
+          export AR="$SDK/llvm/bin/llvm-ar" LD="$SDK/llvm/bin/ld.lld"
+          export CFLAGS="--target=aarch64-linux-ohos --sysroot=$SDK/sysroot"
+          export CXXFLAGS="--target=aarch64-linux-ohos --sysroot=$SDK/sysroot -stdlib=libc++"
+          export LDFLAGS="--target=aarch64-linux-ohos --sysroot=$SDK/sysroot -stdlib=libc++ -fuse-ld=lld"
+          python3 configure.py \
+            --dest-os=openharmony \
+            --dest-cpu=arm64 \
+            --cross-compiling \
+            --shared \
+            --use_clang \
+            --openssl-no-asm \
+            --without-npm \
+            --without-corepack \
+            --without-inspector \
+            --without-node-snapshot \
+            --without-node-code-cache \
+            --without-node-options \
+            --with-intl=small-icu \
+            --with-icu-locales=root,en \
+            --v8-options=--jitless
+          test -f out/Makefile
+
+      - name: Build node_mksnapshot
+        working-directory: node-src
+        run: |
+          set -euxo pipefail
+          grep -c node_mksnapshot out/Makefile || true
+          make -C out BUILDTYPE=Release -j"$(nproc)" node_mksnapshot
+
+      - name: Generate snapshot
+        working-directory: node-src
+        run: |
+          ls -la out/Release | head -30
+          ./out/Release/node_mksnapshot \
+            --startup-src=lib/internal/bootstrap/startup.js \
+            --startup-blob=out/Release/snapshot_blob.bin || true
+          # Some Node versions take the default snapshot:
+          ./out/Release/node_mksnapshot out/Release/snapshot_blob.bin || true
+          ls -la out/Release/snapshot_blob.bin || { echo "snapshot not produced"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ohos-arm64-node-snapshot
+          path: |
+            node-src/out/Release/snapshot_blob.bin
+            node-src/out/Release/node_mksnapshot
+          if-no-files-found: error
